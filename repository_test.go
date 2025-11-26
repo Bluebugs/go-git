@@ -1001,6 +1001,73 @@ func (s *RepositorySuite) TestPlainCloneSharedSSHShouldReturnError() {
 	s.ErrorIs(err, ErrAlternatePathNotSupported)
 }
 
+func (s *RepositorySuite) TestPlainCloneSharedNoCheckout() {
+	dir := s.T().TempDir()
+	remote := s.GetBasicLocalRepositoryURL()
+
+	r, err := PlainClone(dir, &CloneOptions{
+		URL:        remote,
+		Shared:     true,
+		NoCheckout: true,
+	})
+	s.NoError(err)
+
+	// Verify alternates file is set up correctly
+	altpath := path.Join(dir, GitDirName, "objects", "info", "alternates")
+	_, err = os.Stat(altpath)
+	s.NoError(err)
+
+	data, err := os.ReadFile(altpath)
+	s.NoError(err)
+
+	line := path.Join(remote, GitDirName, "objects") + "\n"
+	s.Equal(line, string(data))
+
+	// Verify branches config
+	cfg, err := r.Config()
+	s.NoError(err)
+	s.Len(cfg.Branches, 1)
+	s.Equal("master", cfg.Branches["master"].Name)
+
+	// Verify HEAD is set
+	head, err := r.Head()
+	s.NoError(err)
+	s.NotNil(head)
+
+	// Verify we can access objects through alternates
+	commit, err := r.CommitObject(head.Hash())
+	s.NoError(err)
+	s.NotNil(commit)
+}
+
+func (s *RepositorySuite) TestPlainCloneSharedNoCheckoutBare() {
+	dir := s.T().TempDir()
+	remote := s.GetBasicLocalRepositoryURL()
+
+	r, err := PlainClone(dir, &CloneOptions{
+		URL:        remote,
+		Shared:     true,
+		NoCheckout: true,
+		Bare:       true,
+	})
+	s.NoError(err)
+
+	// Verify alternates file is set up correctly
+	altpath := path.Join(dir, "objects", "info", "alternates")
+	_, err = os.Stat(altpath)
+	s.NoError(err)
+
+	// Verify HEAD is set
+	head, err := r.Head()
+	s.NoError(err)
+	s.NotNil(head)
+
+	// Verify we can access objects through alternates
+	commit, err := r.CommitObject(head.Hash())
+	s.NoError(err)
+	s.NotNil(commit)
+}
+
 func (s *RepositorySuite) TestPlainCloneWithRemoteName() {
 	dir := s.T().TempDir()
 	r, err := PlainClone(dir, &CloneOptions{
@@ -3484,5 +3551,62 @@ func BenchmarkPlainClone(b *testing.B) {
 	b.StartTimer()
 	for i := 0; i < b.N; i++ {
 		clone(b)
+	}
+}
+
+// BenchmarkPlainCloneLocalShared benchmarks cloning a local repository using
+// the Shared option. This demonstrates the overhead of UploadPack when cloning
+// a local repository with Shared: true and NoCheckout: true.
+// The benchmark creates a source repository and measures the time to clone it.
+func BenchmarkPlainCloneLocalShared(b *testing.B) {
+	// Setup: Create a source repository with some content
+	srcDir := b.TempDir()
+	srcRepo, err := PlainInit(srcDir, false)
+	if err != nil {
+		b.Fatalf("failed to init source repo: %v", err)
+	}
+
+	// Create some commits to make it more realistic
+	wt, err := srcRepo.Worktree()
+	if err != nil {
+		b.Fatalf("failed to get worktree: %v", err)
+	}
+
+	for i := 0; i < 10; i++ {
+		filename := fmt.Sprintf("file%d.txt", i)
+		f, err := wt.Filesystem.Create(filename)
+		if err != nil {
+			b.Fatalf("failed to create file: %v", err)
+		}
+		_, _ = f.Write([]byte(fmt.Sprintf("content %d", i)))
+		f.Close()
+		_, err = wt.Add(filename)
+		if err != nil {
+			b.Fatalf("failed to add file: %v", err)
+		}
+		_, err = wt.Commit(fmt.Sprintf("commit %d", i), &CommitOptions{
+			Author: &object.Signature{
+				Name:  "test",
+				Email: "test@test.com",
+				When:  time.Now(),
+			},
+		})
+		if err != nil {
+			b.Fatalf("failed to commit: %v", err)
+		}
+	}
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		dstDir := b.TempDir()
+		_, err := PlainClone(dstDir, &CloneOptions{
+			URL:        srcDir,
+			Shared:     true,
+			NoCheckout: true,
+		})
+		if err != nil {
+			b.Fatalf("failed to clone: %v", err)
+		}
 	}
 }
