@@ -1227,6 +1227,37 @@ func (s *RepositorySuite) TestPlainCloneSharedLocalViaSymlink() {
 	s.NotNil(commit)
 }
 
+func (s *RepositorySuite) TestPlainCloneSharedFixtureViaSymlink() {
+	// Try to reproduce macOS failure using the real test fixture.
+	// Use a symlinked path as the source repo URL, clone without NoCheckout
+	// so the clone will attempt to checkout and must read objects through
+	// the alternates mechanism.
+	dir := s.T().TempDir()
+
+	// Create a real base dir and a symlink pointing to it (simulate /var -> /private/var)
+	realBase := s.T().TempDir()
+	linkParent := s.T().TempDir()
+	symlinkRoot := path.Join(linkParent, "link")
+	s.NoError(os.Symlink(realBase, symlinkRoot))
+
+	// Get the fixture repo into the real base, using fixture helper which supports WithTargetDir
+	_ = fixtures.Basic().One().DotGit(fixtures.WithTargetDir(func() string { return path.Join(realBase, "src") }))
+
+	// Use the symlinked path as the URL for cloning
+	symlinkURL := path.Join(symlinkRoot, "src")
+
+	// Destination
+	dst := dir
+
+	// Perform plain clone (no NoCheckout) to force object access through alternates
+	_, err := PlainClone(dst, &CloneOptions{
+		URL:    symlinkURL,
+		Shared: true,
+	})
+
+	s.NoError(err)
+}
+
 func (s *RepositorySuite) TestPlainCloneSharedLocalNestedAlternates() {
 	// This test reproduces an issue where nested alternates fail because
 	// AlternatesFS is not propagated to alternate DotGit objects.
