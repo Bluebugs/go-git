@@ -977,18 +977,20 @@ func TestAlternatesSymlinkWithChroot(t *testing.T) {
 	destFS, err := baseFS.Chroot(filepath.Join("dest", ".git"))
 	assert.NoError(t, err)
 
-	// Create DotGit without AlternatesFS - this should fail
-	// because the chroot can't access paths outside its root
+	// Create DotGit without AlternatesFS - this should now succeed
+	// because the Alternates() method automatically uses osfs.New("/")
+	// for absolute paths when AlternatesFS is not explicitly set.
+	// This is the fix for macOS where /var -> /private/var symlinks
+	// would cause failures when the chroot couldn't access paths outside its root.
 	dir := New(destFS)
-	_, err = dir.Alternates()
-	assert.Error(t, err, "should fail without AlternatesFS when alternates path is outside chroot")
-	assert.Contains(t, err.Error(), "invalid object directory")
+	dotgits, err := dir.Alternates()
+	assert.NoError(t, err, "should succeed even without AlternatesFS because absolute paths are auto-resolved with osfs.New(\"/\")")
+	assert.Len(t, dotgits, 1)
 
-	// Now create DotGit WITH AlternatesFS rooted at /
-	// This should succeed because we can resolve paths directly
+	// Also verify it works with explicit AlternatesFS rooted at /
 	rootFS := osfs.New("/", osfs.WithBoundOS())
 	dirWithAltFS := NewWithOptions(destFS, Options{AlternatesFS: rootFS})
-	dotgits, err := dirWithAltFS.Alternates()
+	dotgits, err = dirWithAltFS.Alternates()
 	assert.NoError(t, err, "should succeed with AlternatesFS rooted at /")
 	assert.Len(t, dotgits, 1)
 }

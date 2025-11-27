@@ -1258,6 +1258,45 @@ func (s *RepositorySuite) TestPlainCloneSharedFixtureViaSymlink() {
 	s.NoError(err)
 }
 
+func (s *RepositorySuite) TestCloneSharedIntoMemfs() {
+	// This test attempts to reproduce macOS failures on Linux by using memfs.
+	// When cloning with Shared: true into a memfs-based filesystem storage,
+	// the alternates file will contain an absolute path on the OS filesystem,
+	// but the clone's storage is in memfs and cannot access those paths.
+	//
+	// This simulates the issue on macOS where the chrooted filesystem cannot
+	// cross boundaries to access alternates paths.
+
+	// Get a local repository URL (on OS filesystem)
+	srcURL := s.GetBasicLocalRepositoryURL()
+
+	// Create a memfs-based filesystem storage for the destination
+	// This simulates a storage that cannot access OS filesystem paths
+	mfs := memfs.New()
+	dot, err := mfs.Chroot(".git")
+	s.NoError(err)
+	sto := filesystem.NewStorage(dot, cache.NewObjectLRUDefault())
+
+	// Clone using the Clone function (not PlainClone) with Shared: true
+	r, err := Clone(sto, mfs, &CloneOptions{
+		URL:    srcURL,
+		Shared: true,
+	})
+	// The clone should succeed (alternates file written), but object access may fail
+	s.NoError(err)
+
+	// Get HEAD
+	head, err := r.Head()
+	s.NoError(err)
+	s.NotNil(head)
+
+	// Try to access an object - this will fail if alternates cannot be resolved
+	// because the memfs cannot access the OS filesystem paths in alternates
+	commit, err := r.CommitObject(head.Hash())
+	s.NoError(err)
+	s.NotNil(commit)
+}
+
 func (s *RepositorySuite) TestPlainCloneSharedLocalNestedAlternates() {
 	// This test reproduces an issue where nested alternates fail because
 	// AlternatesFS is not propagated to alternate DotGit objects.
