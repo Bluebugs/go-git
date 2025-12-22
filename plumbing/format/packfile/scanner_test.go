@@ -576,3 +576,119 @@ var expectedCRCREF = []uint32{
 	0x740bf39,
 	0x26af4735,
 }
+
+// TestScanLazyMode tests that scanner in lazy mode skips decompression
+// and only records ContentOffset.
+func TestScanLazyMode(t *testing.T) {
+	packfile := fixtures.Basic().One().Packfile()
+
+	// Create scanner with lazy mode enabled
+	s := NewScanner(packfile, WithLazyMode(true))
+
+	objectCount := 0
+	for s.Scan() {
+		data := s.Data()
+
+		if data.Section == ObjectSection {
+			oh := data.Value().(ObjectHeader)
+
+			// In lazy mode, content should be nil
+			assert.Nil(t, oh.content, "content should be nil in lazy mode for object at offset %d", oh.Offset)
+
+			// ContentOffset should be set
+			assert.NotZero(t, oh.ContentOffset, "ContentOffset should be set for object at offset %d", oh.Offset)
+
+			// Other fields should still be populated
+			assert.NotZero(t, oh.Type, "Type should be set")
+			assert.NotZero(t, oh.Size, "Size should be set")
+
+			objectCount++
+		}
+	}
+
+	assert.NoError(t, s.Error())
+	assert.Greater(t, objectCount, 0, "should have scanned at least one object")
+}
+
+
+// TestScanLazyMode_DeltaObjects tests lazy mode with delta objects.
+func TestScanLazyMode_DeltaObjects(t *testing.T) {
+	// Use packfile with delta objects
+	packfile := fixtures.Basic().ByTag("ref-delta").One().Packfile()
+
+	s := NewScanner(packfile, WithLazyMode(true))
+
+	deltaCount := 0
+	for s.Scan() {
+		data := s.Data()
+
+		if data.Section == ObjectSection {
+			oh := data.Value().(ObjectHeader)
+
+			if oh.Type.IsDelta() {
+				deltaCount++
+
+				// Delta objects in lazy mode should also skip decompression
+				assert.Nil(t, oh.content, "delta object should have nil content in lazy mode")
+				assert.NotZero(t, oh.ContentOffset, "delta object should have ContentOffset")
+			}
+		}
+	}
+
+	assert.NoError(t, s.Error())
+	assert.Greater(t, deltaCount, 0, "should have found delta objects")
+}
+
+// TestScanLazyMode_ContentOffsetValidity tests that ContentOffset is valid.
+func TestScanLazyMode_ContentOffsetValidity(t *testing.T) {
+	packfile := fixtures.Basic().One().Packfile()
+
+	s := NewScanner(packfile, WithLazyMode(true))
+
+	previousOffset := int64(0)
+	for s.Scan() {
+		data := s.Data()
+
+		if data.Section == ObjectSection {
+			oh := data.Value().(ObjectHeader)
+
+			// ContentOffset should be after the object header
+			assert.Greater(t, oh.ContentOffset, oh.Offset,
+				"ContentOffset should be after object Offset")
+
+			// ContentOffset should be increasing
+			assert.Greater(t, oh.ContentOffset, previousOffset,
+				"ContentOffsets should increase")
+
+			previousOffset = oh.ContentOffset
+		}
+	}
+
+	assert.NoError(t, s.Error())
+}
+
+// TestScanLazyMode_WithSHA256 tests lazy mode with SHA256.
+func TestScanLazyMode_WithSHA256(t *testing.T) {
+	packfile := fixtures.Basic().One().Packfile()
+
+	s := NewScanner(packfile, WithLazyMode(true), WithSHA256())
+
+	objectCount := 0
+	for s.Scan() {
+		data := s.Data()
+
+		if data.Section == ObjectSection {
+			oh := data.Value().(ObjectHeader)
+
+			// Should still skip decompression with SHA256 enabled
+			assert.Nil(t, oh.content, "content should be nil even with SHA256")
+			assert.NotZero(t, oh.ContentOffset, "ContentOffset should be set")
+
+			objectCount++
+		}
+	}
+
+	assert.NoError(t, s.Error())
+	assert.Greater(t, objectCount, 0)
+}
+

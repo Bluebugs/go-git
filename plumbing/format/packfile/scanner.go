@@ -35,6 +35,45 @@ var (
 	ErrSeekNotSupported = NewError("not seek support")
 )
 
+// LazyStorageCapable is an interface for storage that supports lazy loading.
+// When implemented, the scanner can detect it and store blobs as LazyMemoryObjects
+// without decompressing their content.
+type LazyStorageCapable interface {
+	// IsLazyLoadingEnabled returns true if lazy loading is enabled.
+	IsLazyLoadingEnabled() bool
+	// StoreLazyObject stores a lazy object with the given metadata.
+	// objectOffset is the offset to the object header in the packfile (for OFS_DELTA tracking).
+	// contentOffset is the offset to the compressed content (for decompression).
+	StoreLazyObject(typ plumbing.ObjectType, hash plumbing.Hash, size int64, objectOffset int64, contentOffset int64) error
+	// TrackObjectOffset records the offset-to-hash mapping for an object.
+	// This is needed for OFS_DELTA resolution when the base object is stored eagerly.
+	TrackObjectOffset(offset int64, hash plumbing.Hash)
+}
+
+// LazyDeltaStorageCapable is an interface for storage that supports lazy delta objects.
+// When implemented, the parser can store delta objects as LazyDeltaObjects
+// without eagerly resolving them.
+type LazyDeltaStorageCapable interface {
+	LazyStorageCapable
+	// StoreLazyDeltaObject stores a lazy delta object with the given metadata.
+	// The delta will be resolved on-demand when the object is read.
+	StoreLazyDeltaObject(
+		typ plumbing.ObjectType,
+		hash plumbing.Hash,
+		size int64,
+		deltaOffset int64,
+		deltaType plumbing.DeltaType,
+		baseHash plumbing.Hash,
+		baseOffset int64,
+		objectOffset int64,
+	) error
+	// SetDeltaPatcher sets the delta patcher function for lazy delta resolution.
+	SetDeltaPatcher(patcher plumbing.DeltaPatcher)
+	// SetParsingInProgress indicates whether packfile parsing is in progress.
+	// When true, packfile eviction should be deferred until parsing completes.
+	SetParsingInProgress(inProgress bool)
+}
+
 // Scanner provides sequential access to the data stored in a Git packfile.
 //
 // A Git packfile is a compressed binary format that stores multiple Git objects,
@@ -99,6 +138,7 @@ type Scanner struct {
 	rbuf *bufio.Reader
 
 	lowMemoryMode bool
+	lazyMode      bool // Skip decompression, only record ContentOffset
 }
 
 // NewScanner creates a new instance of Scanner.
@@ -399,46 +439,90 @@ func objectEntry(r *Scanner) (stateFn, error) {
 	defer gogitsync.PutZlibReader(zr)
 
 	if !oh.Type.IsDelta() {
-		r.hasher.Reset(oh.Type, oh.Size)
+		// Check if storage supports lazy loading and this is a blob
+		// Lazy loading requires a seekable packfile so we can re-read compressed data later
+		lazyStorage, isLazyCapable := r.storage.(LazyStorageCapable)
+		useLazyStorage := isLazyCapable && lazyStorage.IsLazyLoadingEnabled() && oh.Type == plumbing.BlobObject && r.seeker != nil
 
-		var mw io.Writer = r.hasher
-		if r.storage != nil {
-			w, err := r.storage.RawObjectWriter(oh.Type, oh.Size)
+		if useLazyStorage {
+			// For lazy blobs, we need to calculate hash but skip storing via RawObjectWriter
+			// We'll decompress only to calculate the hash, then discard the content
+			r.hasher.Reset(oh.Type, oh.Size)
+			var mw io.Writer = r.hasher
+
+			if r.hasher256 != nil {
+				r.hasher256.Reset(oh.Type, oh.Size)
+				mw = io.MultiWriter(mw, r.hasher256)
+			}
+
+			// Decompress only to calculate hash
+			_, err = ioutil.CopyBufferPool(mw, zr)
 			if err != nil {
 				return nil, err
 			}
 
-			defer func() { _ = w.Close() }()
-			mw = io.MultiWriter(r.hasher, w)
-		}
+			oh.Hash = r.hasher.Sum()
+			if r.hasher256 != nil {
+				h := r.hasher256.Sum()
+				oh.Hash256 = &h
+			}
 
-		// If the reader isn't seekable, and low memory mode
-		// isn't supported, keep the contents of the objects in
-		// memory.
-		if !r.lowMemoryMode && r.seeker == nil {
-			oh.content = gogitsync.GetBytesBuffer()
-			mw = io.MultiWriter(mw, oh.content)
-		}
-		if r.hasher256 != nil {
-			r.hasher256.Reset(oh.Type, oh.Size)
-			mw = io.MultiWriter(mw, r.hasher256)
-		}
+			// Store as lazy object with metadata only
+			err = lazyStorage.StoreLazyObject(oh.Type, oh.Hash, oh.Size, oh.Offset, oh.ContentOffset)
+			if err != nil {
+				return nil, fmt.Errorf("failed to store lazy object: %w", err)
+			}
+		} else {
+			// Normal (eager) storage path
+			r.hasher.Reset(oh.Type, oh.Size)
 
-		// For non delta objects, simply calculate the hash of each object.
-		_, err = ioutil.CopyBufferPool(mw, zr)
-		if err != nil {
-			return nil, err
-		}
+			var mw io.Writer = r.hasher
+			if r.storage != nil {
+				w, err := r.storage.RawObjectWriter(oh.Type, oh.Size)
+				if err != nil {
+					return nil, err
+				}
 
-		oh.Hash = r.hasher.Sum()
-		if r.hasher256 != nil {
-			h := r.hasher256.Sum()
-			oh.Hash256 = &h
+				defer w.Close()
+				mw = io.MultiWriter(r.hasher, w)
+			}
+
+			// If the reader isn't seekable, and low memory mode or lazy mode
+			// isn't enabled, keep the contents of the objects in memory.
+			// In lazy mode, we skip decompression to save memory.
+			if !r.lowMemoryMode && !r.lazyMode && r.seeker == nil {
+				oh.content = gogitsync.GetBytesBuffer()
+				mw = io.MultiWriter(mw, oh.content)
+			}
+			if r.hasher256 != nil {
+				r.hasher256.Reset(oh.Type, oh.Size)
+				mw = io.MultiWriter(mw, r.hasher256)
+			}
+
+			// For non delta objects, simply calculate the hash of each object.
+			_, err = ioutil.CopyBufferPool(mw, zr)
+			if err != nil {
+				return nil, err
+			}
+
+			oh.Hash = r.hasher.Sum()
+			if r.hasher256 != nil {
+				h := r.hasher256.Sum()
+				oh.Hash256 = &h
+			}
+
+			// When lazy loading is enabled, also track offset for non-blob objects.
+			// This is needed for OFS_DELTA resolution when the base object is a tree/commit/tag.
+			if isLazyCapable && lazyStorage.IsLazyLoadingEnabled() {
+				lazyStorage.TrackObjectOffset(oh.Offset, oh.Hash)
+			}
 		}
 	} else {
+		// For delta objects:
 		// If data source is not io.Seeker, keep the content
 		// in the cache, so that it can be accessed by the Parser.
-		if !r.lowMemoryMode {
+		// In lazy mode or low memory mode, discard the data.
+		if !r.lowMemoryMode && !r.lazyMode {
 			oh.content = gogitsync.GetBytesBuffer()
 			_, err = oh.content.ReadFrom(zr)
 			if err != nil {
@@ -447,6 +531,7 @@ func objectEntry(r *Scanner) (stateFn, error) {
 		} else {
 			// We don't know the compressed length, so we can't seek to
 			// the next object, we must discard the data instead.
+			// This applies to both low memory mode and lazy mode.
 			_, err = ioutil.CopyBufferPool(io.Discard, zr)
 			if err != nil {
 				return nil, err

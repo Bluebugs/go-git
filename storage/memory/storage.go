@@ -2,9 +2,11 @@
 package memory
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"github.com/go-git/go-git/v6/config"
@@ -14,6 +16,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/storer"
 	"github.com/go-git/go-git/v6/storage"
 	"github.com/go-git/go-git/v6/utils/ioutil"
+	gogitsync "github.com/go-git/go-git/v6/utils/sync"
 )
 
 // ErrUnsupportedObjectType is returned when an unsupported object type is used.
@@ -46,12 +49,14 @@ func NewStorage(o ...StorageOption) *Storage {
 		ConfigStorage:    ConfigStorage{},
 		ShallowStorage:   ShallowStorage{},
 		ObjectStorage: ObjectStorage{
-			oh:      plumbing.FromObjectFormat(opts.objectFormat),
-			Objects: make(map[plumbing.Hash]plumbing.EncodedObject),
-			Commits: make(map[plumbing.Hash]plumbing.EncodedObject),
-			Trees:   make(map[plumbing.Hash]plumbing.EncodedObject),
-			Blobs:   make(map[plumbing.Hash]plumbing.EncodedObject),
-			Tags:    make(map[plumbing.Hash]plumbing.EncodedObject),
+			oh:            plumbing.FromObjectFormat(opts.objectFormat),
+			Objects:       make(map[plumbing.Hash]plumbing.EncodedObject),
+			Commits:       make(map[plumbing.Hash]plumbing.EncodedObject),
+			Trees:         make(map[plumbing.Hash]plumbing.EncodedObject),
+			Blobs:         make(map[plumbing.Hash]plumbing.EncodedObject),
+			Tags:          make(map[plumbing.Hash]plumbing.EncodedObject),
+			lazyLoadBlobs: opts.lazyLoadBlobs,
+			lazyThreshold: opts.lazyThreshold,
 		},
 		ModuleStorage: make(ModuleStorage),
 	}
@@ -117,6 +122,30 @@ type ObjectStorage struct {
 	Trees   map[plumbing.Hash]plumbing.EncodedObject
 	Blobs   map[plumbing.Hash]plumbing.EncodedObject
 	Tags    map[plumbing.Hash]plumbing.EncodedObject
+
+	// Mutex for protecting object maps during concurrent access
+	objectsMu sync.RWMutex
+
+	// Packfile retention for lazy loading
+	packfileData   []byte      // Raw packfile data in memory
+	packfileReader io.ReaderAt // ReaderAt interface for seeking
+
+	// Lazy loading configuration
+	lazyLoadBlobs bool
+	lazyThreshold int64
+
+	// Packfile eviction tracking
+	lazyObjectCount   int        // Total number of lazy objects created
+	cachedObjectCount int        // Number of lazy objects that have been cached
+	parsingInProgress bool       // True during packfile parsing, prevents premature eviction
+	packfileMu        sync.Mutex // Protects packfile eviction
+
+	// Offset-to-object mapping for OFS_DELTA resolution
+	// Maps packfile offset to object hash for lazy delta lookups
+	objectsByOffset map[int64]plumbing.Hash
+
+	// Delta patcher function (set during lazy loading initialization)
+	deltaPatcher plumbing.DeltaPatcher
 }
 
 type lazyCloser struct {
@@ -161,6 +190,10 @@ func (o *ObjectStorage) NewEncodedObject() plumbing.EncodedObject {
 // SetEncodedObject stores the given EncodedObject.
 func (o *ObjectStorage) SetEncodedObject(obj plumbing.EncodedObject) (plumbing.Hash, error) {
 	h := obj.Hash()
+
+	o.objectsMu.Lock()
+	defer o.objectsMu.Unlock()
+
 	o.Objects[h] = obj
 
 	switch obj.Type() {
@@ -181,7 +214,10 @@ func (o *ObjectStorage) SetEncodedObject(obj plumbing.EncodedObject) (plumbing.H
 
 // HasEncodedObject returns nil if the object exists, or an error otherwise.
 func (o *ObjectStorage) HasEncodedObject(h plumbing.Hash) (err error) {
-	if _, ok := o.Objects[h]; !ok {
+	o.objectsMu.RLock()
+	_, ok := o.Objects[h]
+	o.objectsMu.RUnlock()
+	if !ok {
 		return plumbing.ErrObjectNotFound
 	}
 	return nil
@@ -191,7 +227,9 @@ func (o *ObjectStorage) HasEncodedObject(h plumbing.Hash) (err error) {
 func (o *ObjectStorage) EncodedObjectSize(h plumbing.Hash) (
 	size int64, err error,
 ) {
+	o.objectsMu.RLock()
 	obj, ok := o.Objects[h]
+	o.objectsMu.RUnlock()
 	if !ok {
 		return 0, plumbing.ErrObjectNotFound
 	}
@@ -201,7 +239,9 @@ func (o *ObjectStorage) EncodedObjectSize(h plumbing.Hash) (
 
 // EncodedObject returns the object with the given type and hash.
 func (o *ObjectStorage) EncodedObject(t plumbing.ObjectType, h plumbing.Hash) (plumbing.EncodedObject, error) {
+	o.objectsMu.RLock()
 	obj, ok := o.Objects[h]
+	o.objectsMu.RUnlock()
 	if !ok || (plumbing.AnyObject != t && obj.Type() != t) {
 		return nil, plumbing.ErrObjectNotFound
 	}
@@ -211,6 +251,9 @@ func (o *ObjectStorage) EncodedObject(t plumbing.ObjectType, h plumbing.Hash) (p
 
 // IterEncodedObjects returns an iterator for all objects of the given type.
 func (o *ObjectStorage) IterEncodedObjects(t plumbing.ObjectType) (storer.EncodedObjectIter, error) {
+	o.objectsMu.RLock()
+	defer o.objectsMu.RUnlock()
+
 	var series []plumbing.EncodedObject
 	switch t {
 	case plumbing.AnyObject:
@@ -246,7 +289,15 @@ func (o *ObjectStorage) Begin() storer.Transaction {
 
 // ForEachObjectHash calls the given function for each object hash.
 func (o *ObjectStorage) ForEachObjectHash(fun func(plumbing.Hash) error) error {
+	o.objectsMu.RLock()
+	// Copy hashes to avoid holding lock during callback
+	hashes := make([]plumbing.Hash, 0, len(o.Objects))
 	for h := range o.Objects {
+		hashes = append(hashes, h)
+	}
+	o.objectsMu.RUnlock()
+
+	for _, h := range hashes {
 		err := fun(h)
 		if err != nil {
 			if errors.Is(err, storer.ErrStop) {
@@ -283,6 +334,271 @@ func (o *ObjectStorage) DeleteLooseObject(plumbing.Hash) error {
 // AddAlternate returns an error as alternates are not supported.
 func (o *ObjectStorage) AddAlternate(_ string) error {
 	return errNotSupported
+}
+
+// SetPackfileData stores the raw packfile data in memory for lazy loading.
+// This enables LazyMemoryObjects to decompress content on-demand by reading
+// from the packfile at specific offsets.
+//
+// The packfile data is stored as-is (compressed) which is more memory-efficient
+// than decompressing all objects upfront.
+//
+// Parameters:
+//   - data: Raw packfile bytes (including PACK header and footer)
+//
+// This method is typically called during clone/fetch operations when
+// lazy loading is enabled.
+func (o *ObjectStorage) SetPackfileData(data []byte) error {
+	o.packfileData = data
+
+	if data != nil {
+		o.packfileReader = bytes.NewReader(data)
+	} else {
+		o.packfileReader = nil
+	}
+
+	return nil
+}
+
+// GetPackfileReader returns an io.ReaderAt for the stored packfile data.
+// This allows seeking to specific offsets to decompress individual objects.
+//
+// Returns nil if no packfile data has been set or if the packfile has been
+// evicted after all lazy objects were cached.
+//
+// Thread safety note: bytes.Reader.ReadAt is safe for concurrent use.
+// However, the packfile may be evicted (set to nil) when all lazy objects
+// have been cached. LazyMemoryObjects hold a reference to the reader obtained
+// at creation time, so they remain valid even after eviction. New calls to
+// this method after eviction will return nil.
+func (o *ObjectStorage) GetPackfileReader() io.ReaderAt {
+	return o.packfileReader
+}
+
+// pooledZlibReaderFunc returns a ZlibReaderFunc that uses a sync.Pool for zlib readers.
+// This reduces allocations when decompressing lazy objects.
+func pooledZlibReaderFunc(r io.Reader) (io.ReadCloser, func(), error) {
+	zr, err := gogitsync.GetZlibReader(r)
+	if err != nil {
+		return nil, func() {}, err
+	}
+	return zr, func() { gogitsync.PutZlibReader(zr) }, nil
+}
+
+// StoreLazyObject creates and stores a LazyMemoryObject for the given object metadata.
+// This is used by the scanner when lazy loading is enabled to store blob metadata
+// without decompressing the content.
+//
+// The object will be created as a LazyMemoryObject that decompresses on-demand
+// from the packfile using the contentOffset.
+//
+// objectOffset is the offset to the object header in the packfile (for OFS_DELTA tracking).
+// contentOffset is the offset to the compressed content (for decompression).
+//
+// Returns an error if the packfile reader is not available or if storing fails.
+func (o *ObjectStorage) StoreLazyObject(typ plumbing.ObjectType, hash plumbing.Hash, size int64, objectOffset int64, contentOffset int64) error {
+	if o.packfileReader == nil {
+		return fmt.Errorf("packfile reader not available for lazy loading")
+	}
+
+	// Create LazyMemoryObject and set all fields
+	lazyObj := plumbing.NewLazyMemoryObject(o.oh)
+	lazyObj.SetType(typ)
+	lazyObj.SetSize(size)
+
+	// Set lazy-specific fields
+	// cacheOnRead is always true: once a lazy blob is read, we cache it in memory
+	// The threshold controls which blobs are lazy in the first place, not caching behavior
+	lazyObj.SetLazyFields(o.packfileReader, contentOffset, true)
+
+	// Use pooled zlib reader for better performance
+	lazyObj.SetZlibReaderFunc(pooledZlibReaderFunc)
+
+	// Set up cache notification for automatic packfile eviction
+	lazyObj.SetCacheNotifier(func() {
+		o.notifyObjectCached()
+	})
+
+	// Set the pre-calculated hash from the scanner
+	lazyObj.SetHash(hash)
+
+	// Track object offset-to-hash mapping for OFS_DELTA resolution
+	// This uses the object header offset, not the content offset
+	o.trackObjectOffset(objectOffset, hash)
+
+	// Increment lazy object count
+	o.packfileMu.Lock()
+	o.lazyObjectCount++
+	o.packfileMu.Unlock()
+
+	// Store the object
+	_, err := o.SetEncodedObject(lazyObj)
+	return err
+}
+
+// StoreLazyDeltaObject creates and stores a LazyDeltaObject for the given delta object metadata.
+// This is used by the parser when lazy loading is enabled to store delta object metadata
+// without eagerly resolving the delta.
+//
+// The object will be created as a LazyDeltaObject that resolves deltas on-demand.
+//
+// Parameters:
+//   - typ: The resolved object type (after delta application)
+//   - hash: The object's hash
+//   - size: The resolved object size
+//   - deltaOffset: Offset to compressed delta instructions in packfile
+//   - deltaType: OFSDelta or REFDelta
+//   - baseHash: Hash of base object (for REFDelta)
+//   - baseOffset: Offset of base object in packfile (for OFSDelta)
+//   - objectOffset: Offset of this delta object in packfile (for tracking)
+//
+// Returns an error if the packfile reader is not available or if storing fails.
+func (o *ObjectStorage) StoreLazyDeltaObject(
+	typ plumbing.ObjectType,
+	hash plumbing.Hash,
+	size int64,
+	deltaOffset int64,
+	deltaType plumbing.DeltaType,
+	baseHash plumbing.Hash,
+	baseOffset int64,
+	objectOffset int64,
+) error {
+	if o.packfileReader == nil {
+		return fmt.Errorf("packfile reader not available for lazy delta loading")
+	}
+
+	if o.deltaPatcher == nil {
+		return fmt.Errorf("delta patcher not set for lazy delta loading")
+	}
+
+	// Create LazyDeltaObject and set all fields
+	lazyObj := plumbing.NewLazyDeltaObject(o.oh)
+	lazyObj.SetType(typ)
+	lazyObj.SetSize(size)
+	lazyObj.SetHash(hash)
+
+	// Set lazy delta-specific fields
+	lazyObj.SetLazyDeltaFields(
+		o.packfileReader,
+		deltaOffset,
+		deltaType,
+		baseHash,
+		baseOffset,
+		o,             // ObjectStorage implements LazyDeltaResolver
+		o.deltaPatcher,
+		true, // cacheOnRead
+	)
+
+	// Use pooled zlib reader for better performance
+	lazyObj.SetZlibReaderFunc(pooledZlibReaderFunc)
+
+	// Set up cache notification for automatic packfile eviction
+	lazyObj.SetCacheNotifier(func() {
+		o.notifyObjectCached()
+	})
+
+	// Track offset-to-hash mapping for OFS_DELTA resolution
+	o.trackObjectOffset(objectOffset, hash)
+
+	// Increment lazy object count
+	o.packfileMu.Lock()
+	o.lazyObjectCount++
+	o.packfileMu.Unlock()
+
+	// Store the object
+	_, err := o.SetEncodedObject(lazyObj)
+	return err
+}
+
+// TrackObjectOffset records the mapping from packfile offset to object hash.
+// This is needed for OFS_DELTA resolution when the base object is stored eagerly.
+// Implements part of packfile.LazyStorageCapable interface.
+func (o *ObjectStorage) TrackObjectOffset(offset int64, hash plumbing.Hash) {
+	o.trackObjectOffset(offset, hash)
+}
+
+// trackObjectOffset records the mapping from packfile offset to object hash.
+// This is needed for OFS_DELTA resolution.
+func (o *ObjectStorage) trackObjectOffset(offset int64, hash plumbing.Hash) {
+	o.packfileMu.Lock()
+	defer o.packfileMu.Unlock()
+
+	if o.objectsByOffset == nil {
+		o.objectsByOffset = make(map[int64]plumbing.Hash)
+	}
+	o.objectsByOffset[offset] = hash
+}
+
+// EncodedObjectByOffset retrieves an object by its offset in the packfile.
+// This is used for OFS_DELTA resolution where we only have an offset, not a hash.
+// Implements plumbing.OffsetResolver interface.
+func (o *ObjectStorage) EncodedObjectByOffset(offset int64) (plumbing.EncodedObject, error) {
+	o.packfileMu.Lock()
+	hash, ok := o.objectsByOffset[offset]
+	o.packfileMu.Unlock()
+
+	if !ok {
+		return nil, plumbing.ErrObjectNotFound
+	}
+
+	return o.EncodedObject(plumbing.AnyObject, hash)
+}
+
+// SetDeltaPatcher sets the delta patcher function used for lazy delta resolution.
+// This must be called before storing any lazy delta objects.
+func (o *ObjectStorage) SetDeltaPatcher(patcher plumbing.DeltaPatcher) {
+	o.deltaPatcher = patcher
+}
+
+// notifyObjectCached is called by LazyMemoryObject when it caches its content.
+// This tracks the number of cached objects and automatically evicts the packfile
+// from memory once all lazy objects have been cached.
+func (o *ObjectStorage) notifyObjectCached() {
+	o.packfileMu.Lock()
+	defer o.packfileMu.Unlock()
+
+	o.cachedObjectCount++
+
+	// Don't evict if we're still parsing the packfile
+	if o.parsingInProgress {
+		return
+	}
+
+	// If all lazy objects are now cached, we can evict the packfile from memory
+	if o.cachedObjectCount >= o.lazyObjectCount && o.lazyObjectCount > 0 {
+		// All lazy objects have been read and cached, so we no longer need
+		// the packfile in memory. Set it to nil so GC can reclaim the memory.
+		o.packfileData = nil
+		o.packfileReader = nil
+	}
+}
+
+// SetParsingInProgress indicates whether packfile parsing is in progress.
+// When true, packfile eviction is deferred until parsing completes.
+func (o *ObjectStorage) SetParsingInProgress(inProgress bool) {
+	o.packfileMu.Lock()
+	defer o.packfileMu.Unlock()
+	o.parsingInProgress = inProgress
+}
+
+// IsLazyLoadingEnabled returns true if lazy loading is enabled for this storage.
+func (o *ObjectStorage) IsLazyLoadingEnabled() bool {
+	return o.lazyLoadBlobs
+}
+
+// IsPackfileEvicted returns true if the packfile has been evicted from memory.
+// This happens automatically when all lazy objects have been cached.
+func (o *ObjectStorage) IsPackfileEvicted() bool {
+	o.packfileMu.Lock()
+	defer o.packfileMu.Unlock()
+	return o.packfileReader == nil && o.lazyObjectCount > 0
+}
+
+// GetLazyObjectStats returns statistics about lazy objects for debugging and testing.
+func (o *ObjectStorage) GetLazyObjectStats() (total, cached int) {
+	o.packfileMu.Lock()
+	defer o.packfileMu.Unlock()
+	return o.lazyObjectCount, o.cachedObjectCount
 }
 
 // TxObjectStorage implements storer.Transaction for in-memory storage.

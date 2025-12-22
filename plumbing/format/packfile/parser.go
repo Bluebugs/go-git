@@ -50,6 +50,13 @@ type LowMemoryCapable interface {
 	LowMemoryMode() bool
 }
 
+// PackfileDataStorer is an interface for storage that needs to retain packfile data
+// for lazy loading. When implemented, the parser will buffer the packfile and store
+// it before parsing.
+type PackfileDataStorer interface {
+	SetPackfileData(data []byte) error
+}
+
 // NewParser creates a new Parser.
 // When a storage is set, the objects are written to storage as they
 // are parsed.
@@ -63,7 +70,41 @@ func NewParser(data io.Reader, opts ...ParserOption) *Parser {
 		}
 	}
 
-	p.scanner = NewScanner(data)
+	// Check if storage supports lazy loading and needs packfile data
+	if p.storage != nil {
+		if lazyStorage, ok := p.storage.(LazyStorageCapable); ok && lazyStorage.IsLazyLoadingEnabled() {
+			// Buffer the packfile data for lazy loading.
+			// Note: This reads the entire packfile into memory. For very large
+			// repositories, consider using filesystem-based storage with mmap
+			// support instead, which avoids the allocation overhead of buffering.
+			packfileData, err := io.ReadAll(data)
+			if err != nil {
+				panic(fmt.Sprintf("go-git: failed to buffer packfile for lazy loading: %v", err))
+			}
+
+			// Store the packfile data
+			if packfileStorer, ok := p.storage.(PackfileDataStorer); ok {
+				if err := packfileStorer.SetPackfileData(packfileData); err != nil {
+					// Continue without lazy loading if storage fails
+					p.scanner = NewScanner(bytes.NewReader(packfileData))
+				} else {
+					// Create scanner with seekable reader
+					p.scanner = NewScanner(bytes.NewReader(packfileData))
+				}
+			} else {
+				p.scanner = NewScanner(bytes.NewReader(packfileData))
+			}
+
+			// Set up delta patcher for lazy delta objects
+			if lazyDeltaStorage, ok := p.storage.(LazyDeltaStorageCapable); ok {
+				lazyDeltaStorage.SetDeltaPatcher(PatchDelta)
+			}
+		} else {
+			p.scanner = NewScanner(data)
+		}
+	} else {
+		p.scanner = NewScanner(data)
+	}
 
 	if p.storage != nil {
 		p.scanner.storage = p.storage
@@ -129,6 +170,12 @@ func (p *Parser) resetCache(qty int) {
 func (p *Parser) Parse() (plumbing.Hash, error) {
 	p.m.Lock()
 	defer p.m.Unlock()
+
+	// Mark parsing as in progress to prevent premature packfile eviction
+	if lazyDeltaStorage, ok := p.storage.(LazyDeltaStorageCapable); ok && lazyDeltaStorage.IsLazyLoadingEnabled() {
+		lazyDeltaStorage.SetParsingInProgress(true)
+		defer lazyDeltaStorage.SetParsingInProgress(false)
+	}
 
 	var pendingDeltas []*ObjectHeader
 	var pendingDeltaREFs []*ObjectHeader
@@ -265,11 +312,86 @@ func (p *Parser) processDelta(oh *ObjectHeader) error {
 		return fmt.Errorf("unsupported delta type: %v", oh.Type)
 	}
 
+	// Check if we should use lazy delta storage
+	if lazyDeltaStorage, ok := p.storage.(LazyDeltaStorageCapable); ok && lazyDeltaStorage.IsLazyLoadingEnabled() {
+		return p.processLazyDelta(oh, lazyDeltaStorage)
+	}
+
 	if err := p.ensureContent(oh); err != nil {
 		return err
 	}
 
 	return p.storeOrCache(oh)
+}
+
+// processLazyDelta stores a delta object as a LazyDeltaObject without eagerly resolving it.
+// The delta will be resolved on-demand when the object is read.
+func (p *Parser) processLazyDelta(oh *ObjectHeader, lazyStorage LazyDeltaStorageCapable) error {
+	// For lazy delta, we need to calculate the hash without fully resolving the delta.
+	// We do this by eagerly resolving once to get hash, type, and size, then storing as lazy.
+	//
+	// NOTE: We cannot release oh.content here because subsequent delta objects in the
+	// packfile might use this object as a base. The content will be released when the
+	// parser completes or when the cache evicts the entry.
+	//
+	// The memory savings from LazyDeltaObject come from:
+	// 1. Not storing the resolved content in the final ObjectStorage permanently
+	// 2. Re-resolving the delta on-demand when Reader() is called
+	// 3. If the object is never read, we save the permanent storage memory
+
+	// First, we need to resolve the delta to get the final hash, type, and size.
+	if err := p.ensureContent(oh); err != nil {
+		return err
+	}
+
+	// Determine delta type for lazy storage
+	var deltaType plumbing.DeltaType
+	var baseHash plumbing.Hash
+	var baseOffset int64
+
+	switch oh.diskType {
+	case plumbing.OFSDeltaObject:
+		deltaType = plumbing.OFSDelta
+		baseOffset = oh.OffsetReference
+		// For OFS_DELTA, we need to look up the base hash from the cache
+		if oh.parent != nil {
+			baseHash = oh.parent.Hash
+		}
+	case plumbing.REFDeltaObject:
+		deltaType = plumbing.REFDelta
+		baseHash = oh.Reference
+	}
+
+	// Store as lazy delta object
+	err := lazyStorage.StoreLazyDeltaObject(
+		oh.Type,          // resolved type (not delta type)
+		oh.Hash,          // hash of resolved content
+		oh.Size,          // size of resolved content
+		oh.ContentOffset, // offset to delta instructions
+		deltaType,
+		baseHash,
+		baseOffset,
+		oh.Offset, // offset of this object in packfile
+	)
+	if err != nil {
+		return fmt.Errorf("storing lazy delta object: %w", err)
+	}
+
+	// Still need to cache in parser for potential future base object lookups
+	if p.cache != nil {
+		p.cache.Add(oh)
+	}
+
+	// Notify observers
+	if err := p.onInflatedObjectHeader(oh.Type, oh.Size, oh.Offset); err != nil {
+		return err
+	}
+
+	if err := p.onInflatedObjectContent(oh.Hash, oh.Offset, oh.Crc32, nil); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // parentReader returns a [io.ReaderAt] for the decompressed contents
