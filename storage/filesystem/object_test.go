@@ -606,3 +606,59 @@ func (s *FsSuite) TestGetFromUnpackedDoesNotCacheLargeObjects() {
 	_, ok = objectCache.Get(hash)
 	s.False(ok)
 }
+
+func (s *FsSuite) TestGetFromPackfileTrustIndex() {
+	for _, f := range fixtures.Basic().ByTag(".git") {
+		fs := f.DotGit()
+		dg := dotgit.New(fs)
+		o := NewObjectStorageWithOptions(dg, cache.NewObjectLRUDefault(), Options{TrustIndex: true})
+
+		expected := plumbing.NewHash("6ecf0ef2c2dffb796033e5a02219af86ec6584e5")
+		obj, err := o.EncodedObject(plumbing.AnyObject, expected)
+		s.Require().NoError(err)
+		s.Equal(expected, obj.Hash())
+
+		// Verify we can read the content
+		reader, err := obj.Reader()
+		s.Require().NoError(err)
+		content, err := io.ReadAll(reader)
+		s.Require().NoError(err)
+		reader.Close()
+		s.True(len(content) > 0)
+	}
+}
+
+func (s *FsSuite) TestIterEncodedObjectsTrustIndex() {
+	for _, f := range fixtures.Basic().ByTag(".git") {
+		fs := f.DotGit()
+		dg := dotgit.New(fs)
+		o := NewObjectStorageWithOptions(dg, cache.NewObjectLRUDefault(), Options{TrustIndex: true})
+
+		iter, err := o.IterEncodedObjects(plumbing.AnyObject)
+		s.Require().NoError(err)
+
+		count := 0
+		err = iter.ForEach(func(obj plumbing.EncodedObject) error {
+			// Verify object is valid
+			s.NotEmpty(obj.Hash())
+			s.NotEqual(plumbing.InvalidObject, obj.Type())
+
+			// Verify we can read content
+			reader, err := obj.Reader()
+			if err != nil {
+				return err
+			}
+			content, err := io.ReadAll(reader)
+			if err != nil {
+				return err
+			}
+			reader.Close()
+			s.True(len(content) >= 0)
+
+			count++
+			return nil
+		})
+		s.Require().NoError(err)
+		s.True(count > 0, "should have iterated over at least one object")
+	}
+}

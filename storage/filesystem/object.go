@@ -374,7 +374,8 @@ func (s *ObjectStorage) EncodedObject(t plumbing.ObjectType, h plumbing.Hash) (p
 			// Create a new object storage with the DotGit(s) and check for the
 			// required hash object. Skip when not found.
 			for _, dg := range dotgits {
-				o := NewObjectStorage(dg, s.objectCache)
+				// Pass the same options to alternates so TrustIndex is inherited
+				o := NewObjectStorageWithOptions(dg, s.objectCache, s.options)
 				enobj, enerr := o.EncodedObject(t, h)
 				if enerr != nil {
 					continue
@@ -482,6 +483,35 @@ func (s *ObjectStorage) getFromPackfile(h plumbing.Hash, canBeDelta bool) (plumb
 	s.muI.RLock()
 	idx := s.index[pack]
 	s.muI.RUnlock()
+
+	// If TrustIndex is enabled and we don't need delta objects,
+	// return a LazyFSObject that defers all I/O until accessed
+	if s.options.TrustIndex && !canBeDelta {
+		// Check cache first
+		if obj, ok := s.objectCache.Get(hash); ok {
+			return obj, nil
+		}
+
+		// Open packfile to get its path
+		packFile, err := s.dir.ObjectPack(pack)
+		if err != nil {
+			return nil, err
+		}
+		packPath := packFile.Name()
+		if err := packFile.Close(); err != nil {
+			return nil, err
+		}
+
+		return packfile.NewLazyFSObject(
+			hash,
+			offset,
+			idx,
+			s.dir.Fs(),
+			packPath,
+			s.objectCache,
+			crypto.SHA1.Size(),
+		), nil
+	}
 
 	p, err := s.packfile(idx, pack)
 	if err != nil {
@@ -638,6 +668,12 @@ func (s *ObjectStorage) buildPackfileIters(
 	if err != nil {
 		return nil, err
 	}
+
+	// Use lazy iterator if TrustIndex is enabled
+	if s.options.TrustIndex {
+		return s.buildLazyPackfileIters(t, seen, packs)
+	}
+
 	return &lazyPackfilesIter{
 		hashes: packs,
 		open: func(h plumbing.Hash) (storer.EncodedObjectIter, error) {
@@ -648,6 +684,42 @@ func (s *ObjectStorage) buildPackfileIters(
 			return newPackfileIter(
 				s.dir.Fs(), pack, t, seen, s.index[h],
 				s.objectCache, s.options.KeepDescriptors, crypto.SHA1.Size(),
+			)
+		},
+	}, nil
+}
+
+// buildLazyPackfileIters creates an iterator that returns LazyFSObject instances.
+// This is more efficient because it trusts the index and defers object parsing.
+func (s *ObjectStorage) buildLazyPackfileIters(
+	t plumbing.ObjectType,
+	seen map[plumbing.Hash]struct{},
+	packs []plumbing.Hash,
+) (storer.EncodedObjectIter, error) {
+	objectIDSize := crypto.SHA1.Size()
+
+	return &lazyPackfileIter{
+		hashes: packs,
+		open: func(h plumbing.Hash) (storer.EncodedObjectIter, error) {
+			// Open the packfile to get its path
+			packFile, err := s.dir.ObjectPack(h)
+			if err != nil {
+				return nil, err
+			}
+			packPath := packFile.Name()
+			// Close the file - LazyFSObject will reopen it when needed
+			if err := packFile.Close(); err != nil {
+				return nil, err
+			}
+
+			return newLazyFSObjectIter(
+				s.dir.Fs(),
+				packPath,
+				s.index[h],
+				s.objectCache,
+				seen,
+				t,
+				objectIDSize,
 			)
 		},
 	}, nil

@@ -48,6 +48,13 @@ type Options struct {
 	// mode. This defaults to false. For more information refer to packfile's Parser
 	// WithHighMemoryMode option.
 	HighMemoryMode bool
+	// TrustIndex enables lazy object loading by trusting the pack index.
+	// When enabled, object hashes are taken directly from the index without
+	// verification, and object headers (type/size) are only parsed when accessed.
+	// This significantly reduces I/O and decompression during iteration.
+	// This is safe for existing, verified repositories but should be disabled
+	// when processing untrusted packfiles.
+	TrustIndex bool
 
 	ObjectFormat formatcfg.ObjectFormat
 }
