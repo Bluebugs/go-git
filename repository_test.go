@@ -1233,6 +1233,32 @@ func (s *RepositorySuite) TestPlainCloneNoCheckout() {
 	s.Len(fi, 1) // .git
 }
 
+func (s *RepositorySuite) TestPlainCloneNoCheckoutWithPopulateIndex() {
+	dir := s.T().TempDir()
+
+	r, err := PlainClone(dir, &CloneOptions{
+		URL:           s.GetBasicLocalRepositoryURL(),
+		NoCheckout:    true,
+		PopulateIndex: true,
+	})
+	s.Require().NoError(err)
+
+	h, err := r.Head()
+	s.NoError(err)
+	s.NotEqual(plumbing.ZeroHash, h.Hash())
+
+	// Verify no files were checked out (only .git directory)
+	fi, err := osfs.New(dir).ReadDir("")
+	s.NoError(err)
+	s.Len(fi, 1, "should only have .git directory, no checked out files")
+	s.Equal(".git", fi[0].Name())
+
+	// Verify the index was populated
+	idx, err := r.Storer.Index()
+	s.NoError(err)
+	s.Greater(len(idx.Entries), 0, "index should have entries")
+}
+
 func (s *RepositorySuite) TestFetch() {
 	r, _ := Init(memory.NewStorage())
 	_, err := r.CreateRemote(&config.RemoteConfig{

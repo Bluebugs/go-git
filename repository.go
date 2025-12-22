@@ -977,34 +977,56 @@ func (r *Repository) clone(ctx context.Context, o *CloneOptions) error {
 		return err
 	}
 
-	if r.wt != nil && !o.NoCheckout {
-		w, err := r.Worktree()
-		if err != nil {
-			return err
-		}
+	if r.wt != nil {
+		if !o.NoCheckout {
+			// Normal checkout: populate index and checkout files
+			w, err := r.Worktree()
+			if err != nil {
+				return err
+			}
 
-		head, err := r.Head()
-		if err != nil {
-			return err
-		}
+			head, err := r.Head()
+			if err != nil {
+				return err
+			}
 
-		if err := w.Reset(&ResetOptions{
-			Mode:   MergeReset,
-			Commit: head.Hash(),
-		}); err != nil {
-			return err
-		}
+			if err := w.Reset(&ResetOptions{
+				Mode:   MergeReset,
+				Commit: head.Hash(),
+			}); err != nil {
+				return err
+			}
 
-		if o.RecurseSubmodules != NoRecurseSubmodules {
-			if err := w.updateSubmodules(ctx, &SubmoduleUpdateOptions{
-				RecurseSubmodules: o.RecurseSubmodules,
-				Depth: func() int {
-					if o.ShallowSubmodules {
-						return 1
-					}
-					return 0
-				}(),
-				Auth: o.Auth,
+			if o.RecurseSubmodules != NoRecurseSubmodules {
+				if err := w.updateSubmodules(ctx, &SubmoduleUpdateOptions{
+					RecurseSubmodules: o.RecurseSubmodules,
+					Depth: func() int {
+						if o.ShallowSubmodules {
+							return 1
+						}
+						return 0
+					}(),
+					Auth: o.Auth,
+				}); err != nil {
+					return err
+				}
+			}
+		} else if o.PopulateIndex {
+			// NoCheckout with PopulateIndex: populate index only, no file checkout
+			w, err := r.Worktree()
+			if err != nil {
+				return err
+			}
+
+			head, err := r.Head()
+			if err != nil {
+				return err
+			}
+
+			// MixedReset updates the index without touching the worktree
+			if err := w.Reset(&ResetOptions{
+				Mode:   MixedReset,
+				Commit: head.Hash(),
 			}); err != nil {
 				return err
 			}

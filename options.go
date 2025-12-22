@@ -56,6 +56,12 @@ type CloneOptions struct {
 	Mirror bool
 	// No checkout of HEAD after clone if true.
 	NoCheckout bool
+	// PopulateIndex creates the index file without checking out files.
+	// This is useful when you need the index (e.g., for status checks or
+	// TrustIndex optimization) but don't want to write files to the worktree.
+	// Only effective when NoCheckout is true. When NoCheckout is false,
+	// the index is always populated as part of the normal checkout process.
+	PopulateIndex bool
 	// Limit fetching to the specified number of commits.
 	Depth int
 	// RecurseSubmodules after the clone is created, initialize all submodules
