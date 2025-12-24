@@ -205,7 +205,7 @@ func TestObjectStorage_PackfileData_LargeData(t *testing.T) {
 	}{
 		{0, 100},
 		{1024, 512},
-		{1024*512, 1024},
+		{1024 * 512, 1024},
 		{1024*1024 - 100, 100},
 	}
 
