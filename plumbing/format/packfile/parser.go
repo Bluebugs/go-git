@@ -10,6 +10,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing"
 	format "github.com/go-git/go-git/v6/plumbing/format/config"
 	"github.com/go-git/go-git/v6/plumbing/storer"
+	"github.com/go-git/go-git/v6/storage/memory/shared"
 	"github.com/go-git/go-git/v6/utils/ioutil"
 	"github.com/go-git/go-git/v6/utils/sync"
 )
@@ -33,6 +34,7 @@ type Parser struct {
 	storage       storer.EncodedObjectStorer
 	cache         *parserCache
 	lowMemoryMode bool
+	packfilePath  string // Optional path for shared packfile deduplication
 
 	scanner   *Scanner
 	observers []Observer
@@ -82,17 +84,30 @@ func NewParser(data io.Reader, opts ...ParserOption) *Parser {
 				panic(fmt.Sprintf("go-git: failed to buffer packfile for lazy loading: %v", err))
 			}
 
-			// Store the packfile data
-			if packfileStorer, ok := p.storage.(PackfileDataStorer); ok {
-				if err := packfileStorer.SetPackfileData(packfileData); err != nil {
-					// Continue without lazy loading if storage fails
-					p.scanner = NewScanner(bytes.NewReader(packfileData))
+			// Store the packfile data - use shared storage if path is available
+			if p.packfilePath != "" {
+				if sharedStorer, ok := p.storage.(storer.SharedPackfileCapable); ok {
+					// Extract filesystem identity from packfile path
+					identity, err := p.getPackfileIdentity()
+					if err == nil {
+						// Use shared storage for deduplication
+						if err := sharedStorer.SetPackfileDataShared(packfileData, identity); err == nil {
+							p.scanner = NewScanner(bytes.NewReader(packfileData))
+						} else {
+							// Fall back to non-shared if shared storage fails
+							p.storePackfileDataLegacy(packfileData)
+						}
+					} else {
+						// Fall back to non-shared if identity extraction fails
+						p.storePackfileDataLegacy(packfileData)
+					}
 				} else {
-					// Create scanner with seekable reader
-					p.scanner = NewScanner(bytes.NewReader(packfileData))
+					// Storage doesn't support shared packfiles
+					p.storePackfileDataLegacy(packfileData)
 				}
 			} else {
-				p.scanner = NewScanner(bytes.NewReader(packfileData))
+				// No packfile path provided, use legacy storage
+				p.storePackfileDataLegacy(packfileData)
 			}
 
 			// Set up delta patcher for lazy delta objects
@@ -120,6 +135,36 @@ func NewParser(data io.Reader, opts ...ParserOption) *Parser {
 	p.cache = newParserCache()
 
 	return p
+}
+
+// getPackfileIdentity extracts the filesystem identity from the packfile path.
+func (p *Parser) getPackfileIdentity() (storer.PackfileIdentity, error) {
+	identity, err := shared.GetPackfileIdentity(p.packfilePath)
+	if err != nil {
+		return storer.PackfileIdentity{}, err
+	}
+
+	return storer.PackfileIdentity{
+		Inode:  identity.Inode,
+		Device: identity.Device,
+		Size:   identity.Size,
+		Mtime:  identity.Mtime,
+	}, nil
+}
+
+// storePackfileDataLegacy stores packfile data using the legacy SetPackfileData method.
+func (p *Parser) storePackfileDataLegacy(packfileData []byte) {
+	if packfileStorer, ok := p.storage.(PackfileDataStorer); ok {
+		if err := packfileStorer.SetPackfileData(packfileData); err != nil {
+			// Continue without lazy loading if storage fails
+			p.scanner = NewScanner(bytes.NewReader(packfileData))
+		} else {
+			// Create scanner with seekable reader
+			p.scanner = NewScanner(bytes.NewReader(packfileData))
+		}
+	} else {
+		p.scanner = NewScanner(bytes.NewReader(packfileData))
+	}
 }
 
 func (p *Parser) storeOrCache(oh *ObjectHeader) error {

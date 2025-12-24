@@ -46,3 +46,17 @@ func WithHighMemoryMode() ParserOption {
 		p.lowMemoryMode = false
 	}
 }
+
+// WithPackfilePath sets the filesystem path of the packfile being parsed.
+// This enables shared packfile deduplication when the storage supports
+// the SharedPackfileCapable interface. Multiple storage instances that
+// parse packfiles from the same file path will share a single canonical
+// copy in memory, significantly reducing memory usage.
+//
+// This option is only relevant when using lazy loading with memory storage
+// and cloning from a shared local repository.
+func WithPackfilePath(path string) ParserOption {
+	return func(p *Parser) {
+		p.packfilePath = path
+	}
+}
