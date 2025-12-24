@@ -99,6 +99,45 @@ type PackfileWriter interface {
 	PackfileWriter() (io.WriteCloser, error)
 }
 
+// PackfileIdentity uniquely identifies a packfile using filesystem metadata.
+// This type is re-exported from storage/memory/shared for convenience.
+type PackfileIdentity struct {
+	// Inode number - unique per filesystem
+	Inode uint64
+	// Device ID - distinguishes files across mount points
+	Device uint64
+	// Size in bytes
+	Size int64
+	// Modification time (Unix nanoseconds)
+	Mtime int64
+}
+
+// SharedPackfileCapable is an optional interface for storages that support
+// sharing packfile data across multiple instances using filesystem identity.
+//
+// When multiple storage instances clone from the same shared repository,
+// they can use this interface to deduplicate packfile data in memory by
+// recognizing when they reference the same underlying file on disk.
+//
+// Implementations use filesystem metadata (inode, device, size, mtime) to
+// identify packfiles and share them via canonical handles, reducing memory
+// usage significantly when creating multiple clones from the same source.
+type SharedPackfileCapable interface {
+	EncodedObjectStorer
+
+	// SetPackfileDataShared stores packfile data using a shared canonical store.
+	// The identity parameter identifies the packfile using filesystem metadata,
+	// allowing multiple storage instances to share the same packfile data in memory.
+	//
+	// If a packfile with the same identity already exists in the canonical store,
+	// this method will reference the existing data rather than duplicating it.
+	//
+	// The data parameter contains the raw packfile bytes (including PACK header
+	// and footer). It is only used when creating a new canonical entry; if an
+	// entry already exists, the data parameter is ignored.
+	SetPackfileDataShared(data []byte, identity PackfileIdentity) error
+}
+
 // EncodedObjectIter is a generic closable interface for iterating over objects.
 type EncodedObjectIter interface {
 	Next() (plumbing.EncodedObject, error)
