@@ -48,9 +48,36 @@ func WithObjectFormat(of formatcfg.ObjectFormat) StorageOption {
 //   - WithLazyLoading(1024)     // Only blobs > 1KB are lazy
 //   - WithLazyLoading(1<<20)    // Only blobs > 1MB are lazy
 //
+// # Shared Packfile Deduplication
+//
+// When using lazy loading with memory storage, packfiles can be automatically
+// deduplicated across multiple storage instances that reference the same
+// underlying files. This is particularly useful when creating multiple clones
+// from the same shared local repository.
+//
+// The storage uses filesystem metadata (inode, device, size, mtime) to identify
+// when multiple instances are working with the same packfile and shares a single
+// canonical copy in memory using Go 1.23's unique.Handle.
+//
+// Example - 10 clones sharing one packfile:
+//
+//	for i := 0; i < 10; i++ {
+//	    storage := memory.NewStorage(memory.WithLazyLoading(0))
+//	    repo, _ := git.Clone(storage, nil, &git.CloneOptions{
+//	        URL: "/path/to/shared/repo",
+//	    })
+//	    // All 10 storages share same packfile in memory
+//	    // Memory usage: ~1x packfile size instead of 10x
+//	}
+//
+// Deduplication happens automatically when the packfile parser receives
+// filesystem path information via the WithPackfilePath option. The shared
+// packfile data is automatically garbage collected when all storage instances
+// release their references.
+//
 // Note: Lazy loading requires packfile retention in memory. The packfile
 // data remains in compressed form, which is still more memory-efficient
-// than decompressing all objects.
+// than decompressing all objects, and sharing makes it even more efficient.
 func WithLazyLoading(threshold int64) StorageOption {
 	return func(o *options) {
 		o.lazyLoadBlobs = true
