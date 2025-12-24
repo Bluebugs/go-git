@@ -8,6 +8,7 @@ import (
 	"io"
 	"sync"
 	"time"
+	"unique"
 
 	"github.com/go-git/go-git/v6/config"
 	"github.com/go-git/go-git/v6/plumbing"
@@ -15,6 +16,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/format/index"
 	"github.com/go-git/go-git/v6/plumbing/storer"
 	"github.com/go-git/go-git/v6/storage"
+	"github.com/go-git/go-git/v6/storage/memory/shared"
 	"github.com/go-git/go-git/v6/utils/ioutil"
 	gogitsync "github.com/go-git/go-git/v6/utils/sync"
 )
@@ -127,8 +129,9 @@ type ObjectStorage struct {
 	objectsMu sync.RWMutex
 
 	// Packfile retention for lazy loading
-	packfileData   []byte      // Raw packfile data in memory
-	packfileReader io.ReaderAt // ReaderAt interface for seeking
+	packfileData   []byte                             // Raw packfile data in memory (legacy)
+	packfileReader io.ReaderAt                        // ReaderAt interface for seeking (legacy)
+	packfileHandle unique.Handle[*shared.PackfileData] // Shared packfile handle (preferred)
 
 	// Lazy loading configuration
 	lazyLoadBlobs bool
@@ -349,6 +352,9 @@ func (o *ObjectStorage) AddAlternate(_ string) error {
 // This method is typically called during clone/fetch operations when
 // lazy loading is enabled.
 func (o *ObjectStorage) SetPackfileData(data []byte) error {
+	o.packfileMu.Lock()
+	defer o.packfileMu.Unlock()
+
 	o.packfileData = data
 
 	if data != nil {
@@ -356,6 +362,45 @@ func (o *ObjectStorage) SetPackfileData(data []byte) error {
 	} else {
 		o.packfileReader = nil
 	}
+
+	// Clear shared handle if switching to non-shared mode
+	o.packfileHandle = unique.Handle[*shared.PackfileData]{}
+
+	return nil
+}
+
+// SetPackfileDataShared stores packfile data using a shared canonical store.
+// This implements the storer.SharedPackfileCapable interface.
+//
+// Multiple storage instances that clone from the same shared repository will
+// recognize they're working with the same packfile (via filesystem identity)
+// and share a single canonical copy in memory, significantly reducing memory
+// usage.
+//
+// Parameters:
+//   - data: Raw packfile bytes (including PACK header and footer)
+//   - identity: Filesystem identity (inode, device, size, mtime) of the packfile
+//
+// This method is typically called during shared clone operations when
+// lazy loading is enabled.
+func (o *ObjectStorage) SetPackfileDataShared(data []byte, identity storer.PackfileIdentity) error {
+	o.packfileMu.Lock()
+	defer o.packfileMu.Unlock()
+
+	// Convert storer.PackfileIdentity to shared.PackfileIdentity
+	sharedIdentity := shared.PackfileIdentity{
+		Inode:  identity.Inode,
+		Device: identity.Device,
+		Size:   identity.Size,
+		Mtime:  identity.Mtime,
+	}
+
+	// Get or create canonical packfile handle
+	o.packfileHandle = shared.GetOrCreatePackfile(sharedIdentity, data)
+
+	// Clear legacy fields (data is now accessed via handle)
+	o.packfileData = nil
+	o.packfileReader = nil
 
 	return nil
 }
@@ -372,6 +417,15 @@ func (o *ObjectStorage) SetPackfileData(data []byte) error {
 // at creation time, so they remain valid even after eviction. New calls to
 // this method after eviction will return nil.
 func (o *ObjectStorage) GetPackfileReader() io.ReaderAt {
+	o.packfileMu.Lock()
+	defer o.packfileMu.Unlock()
+
+	// Check for shared packfile handle first (preferred)
+	if o.packfileHandle != (unique.Handle[*shared.PackfileData]{}) {
+		return o.packfileHandle.Value().Reader
+	}
+
+	// Fall back to legacy packfileReader
 	return o.packfileReader
 }
 
@@ -570,6 +624,9 @@ func (o *ObjectStorage) notifyObjectCached() {
 		// the packfile in memory. Set it to nil so GC can reclaim the memory.
 		o.packfileData = nil
 		o.packfileReader = nil
+		// Also clear the shared handle to allow GC to reclaim shared packfile
+		// when all storages have evicted their handles
+		o.packfileHandle = unique.Handle[*shared.PackfileData]{}
 	}
 }
 
@@ -591,7 +648,10 @@ func (o *ObjectStorage) IsLazyLoadingEnabled() bool {
 func (o *ObjectStorage) IsPackfileEvicted() bool {
 	o.packfileMu.Lock()
 	defer o.packfileMu.Unlock()
-	return o.packfileReader == nil && o.lazyObjectCount > 0
+	// Packfile is evicted if both legacy reader and shared handle are cleared
+	return o.packfileReader == nil &&
+		o.packfileHandle == (unique.Handle[*shared.PackfileData]{}) &&
+		o.lazyObjectCount > 0
 }
 
 // GetLazyObjectStats returns statistics about lazy objects for debugging and testing.

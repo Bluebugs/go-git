@@ -3,7 +3,11 @@ package memory
 import (
 	"io"
 	"testing"
+	"time"
+	"unique"
 
+	"github.com/go-git/go-git/v6/plumbing/storer"
+	"github.com/go-git/go-git/v6/storage/memory/shared"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -336,4 +340,209 @@ func TestObjectStorage_PackfileEviction_Concurrent(t *testing.T) {
 	assert.Equal(t, numObjects, cached)
 	assert.True(t, storage.ObjectStorage.IsPackfileEvicted())
 	assert.Nil(t, storage.ObjectStorage.packfileReader)
+}
+
+// TestObjectStorage_SetPackfileDataShared tests shared packfile storage.
+func TestObjectStorage_SetPackfileDataShared(t *testing.T) {
+	shared.ClearStore()
+	defer shared.ClearStore()
+
+	storage1 := NewStorage(WithLazyLoading(0))
+	storage2 := NewStorage(WithLazyLoading(0))
+
+	packfileData := []byte("test packfile data for sharing")
+
+	identity := storer.PackfileIdentity{
+		Inode:  12345,
+		Device: 67890,
+		Size:   int64(len(packfileData)),
+		Mtime:  time.Now().UnixNano(),
+	}
+
+	// Store in first storage
+	err := storage1.ObjectStorage.SetPackfileDataShared(packfileData, identity)
+	require.NoError(t, err)
+
+	// Store in second storage with same identity
+	err = storage2.ObjectStorage.SetPackfileDataShared(packfileData, identity)
+	require.NoError(t, err)
+
+	// Both should reference the same canonical packfile
+	reader1 := storage1.ObjectStorage.GetPackfileReader()
+	reader2 := storage2.ObjectStorage.GetPackfileReader()
+
+	assert.NotNil(t, reader1)
+	assert.NotNil(t, reader2)
+
+	// Read from both and verify they return the same data
+	buf1 := make([]byte, len(packfileData))
+	buf2 := make([]byte, len(packfileData))
+
+	n1, err1 := reader1.ReadAt(buf1, 0)
+	n2, err2 := reader2.ReadAt(buf2, 0)
+
+	require.NoError(t, err1)
+	require.NoError(t, err2)
+	assert.Equal(t, len(packfileData), n1)
+	assert.Equal(t, len(packfileData), n2)
+	assert.Equal(t, packfileData, buf1)
+	assert.Equal(t, packfileData, buf2)
+
+	// Verify stats show sharing
+	stats := shared.GetStats()
+	assert.Equal(t, 1, stats.UniquePackfiles)
+}
+
+// TestObjectStorage_SetPackfileDataShared_DifferentIdentities tests multiple packfiles.
+func TestObjectStorage_SetPackfileDataShared_DifferentIdentities(t *testing.T) {
+	shared.ClearStore()
+	defer shared.ClearStore()
+
+	storage1 := NewStorage(WithLazyLoading(0))
+	storage2 := NewStorage(WithLazyLoading(0))
+
+	data1 := []byte("packfile 1")
+	data2 := []byte("packfile 2")
+
+	identity1 := storer.PackfileIdentity{
+		Inode:  12345,
+		Device: 67890,
+		Size:   int64(len(data1)),
+		Mtime:  1000,
+	}
+
+	identity2 := storer.PackfileIdentity{
+		Inode:  54321,
+		Device: 67890,
+		Size:   int64(len(data2)),
+		Mtime:  2000,
+	}
+
+	// Store different packfiles
+	err := storage1.ObjectStorage.SetPackfileDataShared(data1, identity1)
+	require.NoError(t, err)
+
+	err = storage2.ObjectStorage.SetPackfileDataShared(data2, identity2)
+	require.NoError(t, err)
+
+	// Should have 2 unique packfiles
+	stats := shared.GetStats()
+	assert.Equal(t, 2, stats.UniquePackfiles)
+}
+
+// TestObjectStorage_SharedPackfileEviction tests eviction with shared packfiles.
+func TestObjectStorage_SharedPackfileEviction(t *testing.T) {
+	shared.ClearStore()
+	defer shared.ClearStore()
+
+	storage := NewStorage(WithLazyLoading(0))
+
+	packfileData := []byte("test packfile data")
+
+	identity := storer.PackfileIdentity{
+		Inode:  12345,
+		Device: 67890,
+		Size:   int64(len(packfileData)),
+		Mtime:  time.Now().UnixNano(),
+	}
+
+	err := storage.ObjectStorage.SetPackfileDataShared(packfileData, identity)
+	require.NoError(t, err)
+
+	// Simulate lazy objects being created and cached
+	storage.ObjectStorage.lazyObjectCount = 2
+	storage.ObjectStorage.cachedObjectCount = 0
+
+	// First object cached
+	storage.ObjectStorage.notifyObjectCached()
+	assert.False(t, storage.ObjectStorage.IsPackfileEvicted())
+
+	// Second object cached - should evict
+	storage.ObjectStorage.notifyObjectCached()
+	assert.True(t, storage.ObjectStorage.IsPackfileEvicted())
+
+	// Verify handle was cleared
+	assert.Equal(t, unique.Handle[*shared.PackfileData]{}, storage.ObjectStorage.packfileHandle)
+}
+
+// TestObjectStorage_MixedSharedAndNonShared tests backward compatibility.
+func TestObjectStorage_MixedSharedAndNonShared(t *testing.T) {
+	shared.ClearStore()
+	defer shared.ClearStore()
+
+	storage1 := NewStorage(WithLazyLoading(0))
+	storage2 := NewStorage(WithLazyLoading(0))
+
+	packfileData := []byte("test packfile data")
+
+	// Store in first storage using legacy method
+	err := storage1.ObjectStorage.SetPackfileData(packfileData)
+	require.NoError(t, err)
+
+	// Verify legacy storage works
+	reader1 := storage1.ObjectStorage.GetPackfileReader()
+	assert.NotNil(t, reader1)
+
+	// Store in second storage using shared method
+	identity := storer.PackfileIdentity{
+		Inode:  12345,
+		Device: 67890,
+		Size:   int64(len(packfileData)),
+		Mtime:  time.Now().UnixNano(),
+	}
+
+	err = storage2.ObjectStorage.SetPackfileDataShared(packfileData, identity)
+	require.NoError(t, err)
+
+	// Verify shared storage works
+	reader2 := storage2.ObjectStorage.GetPackfileReader()
+	assert.NotNil(t, reader2)
+
+	// Both should work independently
+	buf1 := make([]byte, len(packfileData))
+	buf2 := make([]byte, len(packfileData))
+
+	_, err = reader1.ReadAt(buf1, 0)
+	require.NoError(t, err)
+
+	_, err = reader2.ReadAt(buf2, 0)
+	require.NoError(t, err)
+
+	assert.Equal(t, packfileData, buf1)
+	assert.Equal(t, packfileData, buf2)
+}
+
+// TestObjectStorage_SetPackfileData_ClearsSharedHandle tests transition.
+func TestObjectStorage_SetPackfileData_ClearsSharedHandle(t *testing.T) {
+	shared.ClearStore()
+	defer shared.ClearStore()
+
+	storage := NewStorage(WithLazyLoading(0))
+
+	packfileData := []byte("test packfile data")
+
+	// First set using shared method
+	identity := storer.PackfileIdentity{
+		Inode:  12345,
+		Device: 67890,
+		Size:   int64(len(packfileData)),
+		Mtime:  time.Now().UnixNano(),
+	}
+
+	err := storage.ObjectStorage.SetPackfileDataShared(packfileData, identity)
+	require.NoError(t, err)
+
+	// Verify shared handle is set
+	assert.NotEqual(t, unique.Handle[*shared.PackfileData]{}, storage.ObjectStorage.packfileHandle)
+
+	// Now set using legacy method
+	err = storage.ObjectStorage.SetPackfileData(packfileData)
+	require.NoError(t, err)
+
+	// Verify shared handle is cleared
+	assert.Equal(t, unique.Handle[*shared.PackfileData]{}, storage.ObjectStorage.packfileHandle)
+
+	// Verify legacy fields are set
+	assert.NotNil(t, storage.ObjectStorage.packfileData)
+	assert.NotNil(t, storage.ObjectStorage.packfileReader)
 }
