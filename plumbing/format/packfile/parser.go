@@ -10,6 +10,7 @@ import (
 	"github.com/go-git/go-git/v6/plumbing"
 	format "github.com/go-git/go-git/v6/plumbing/format/config"
 	"github.com/go-git/go-git/v6/plumbing/storer"
+	"github.com/go-git/go-git/v6/storage/memory/shared"
 	"github.com/go-git/go-git/v6/utils/ioutil"
 	"github.com/go-git/go-git/v6/utils/sync"
 )
@@ -33,6 +34,7 @@ type Parser struct {
 	storage       storer.EncodedObjectStorer
 	cache         *parserCache
 	lowMemoryMode bool
+	packfilePath  string // Optional path for shared packfile deduplication
 
 	scanner   *Scanner
 	observers []Observer
@@ -70,41 +72,8 @@ func NewParser(data io.Reader, opts ...ParserOption) *Parser {
 		}
 	}
 
-	// Check if storage supports lazy loading and needs packfile data
-	if p.storage != nil {
-		if lazyStorage, ok := p.storage.(LazyStorageCapable); ok && lazyStorage.IsLazyLoadingEnabled() {
-			// Buffer the packfile data for lazy loading.
-			// Note: This reads the entire packfile into memory. For very large
-			// repositories, consider using filesystem-based storage with mmap
-			// support instead, which avoids the allocation overhead of buffering.
-			packfileData, err := io.ReadAll(data)
-			if err != nil {
-				panic(fmt.Sprintf("go-git: failed to buffer packfile for lazy loading: %v", err))
-			}
-
-			// Store the packfile data
-			if packfileStorer, ok := p.storage.(PackfileDataStorer); ok {
-				if err := packfileStorer.SetPackfileData(packfileData); err != nil {
-					// Continue without lazy loading if storage fails
-					p.scanner = NewScanner(bytes.NewReader(packfileData))
-				} else {
-					// Create scanner with seekable reader
-					p.scanner = NewScanner(bytes.NewReader(packfileData))
-				}
-			} else {
-				p.scanner = NewScanner(bytes.NewReader(packfileData))
-			}
-
-			// Set up delta patcher for lazy delta objects
-			if lazyDeltaStorage, ok := p.storage.(LazyDeltaStorageCapable); ok {
-				lazyDeltaStorage.SetDeltaPatcher(PatchDelta)
-			}
-		} else {
-			p.scanner = NewScanner(data)
-		}
-	} else {
-		p.scanner = NewScanner(data)
-	}
+	// Set up scanner - handle lazy loading if storage supports it
+	p.scanner = p.initScanner(data)
 
 	if p.storage != nil {
 		p.scanner.storage = p.storage
@@ -120,6 +89,97 @@ func NewParser(data io.Reader, opts ...ParserOption) *Parser {
 	p.cache = newParserCache()
 
 	return p
+}
+
+// initScanner initializes the scanner, handling lazy loading and shared packfile storage.
+// It returns the configured Scanner for the packfile data.
+func (p *Parser) initScanner(data io.Reader) *Scanner {
+	// Fast path: no storage or lazy loading not enabled
+	if !p.isLazyLoadingEnabled() {
+		return NewScanner(data)
+	}
+
+	// Buffer the packfile data for lazy loading.
+	// Note: This reads the entire packfile into memory. For very large
+	// repositories, consider using filesystem-based storage with mmap
+	// support instead, which avoids the allocation overhead of buffering.
+	packfileData, err := io.ReadAll(data)
+	if err != nil {
+		panic(fmt.Sprintf("go-git: failed to buffer packfile for lazy loading: %v", err))
+	}
+
+	// Try to store packfile data (shared or legacy)
+	p.storePackfileData(packfileData)
+
+	// Set up delta patcher for lazy delta objects
+	if lazyDeltaStorage, ok := p.storage.(LazyDeltaStorageCapable); ok {
+		lazyDeltaStorage.SetDeltaPatcher(PatchDelta)
+	}
+
+	return NewScanner(bytes.NewReader(packfileData))
+}
+
+// isLazyLoadingEnabled checks if the storage supports and has lazy loading enabled.
+func (p *Parser) isLazyLoadingEnabled() bool {
+	if p.storage == nil {
+		return false
+	}
+	lazyStorage, ok := p.storage.(LazyStorageCapable)
+	return ok && lazyStorage.IsLazyLoadingEnabled()
+}
+
+// storePackfileData stores packfile data using shared storage if available, otherwise legacy.
+func (p *Parser) storePackfileData(packfileData []byte) {
+	// Try shared storage if packfile path is available
+	if p.packfilePath != "" {
+		if p.tryStoreShared(packfileData) {
+			return
+		}
+	}
+
+	// Fall back to legacy storage
+	p.storePackfileLegacy(packfileData)
+}
+
+// tryStoreShared attempts to store packfile data using shared deduplication.
+// Returns true if successful, false if should fall back to legacy storage.
+func (p *Parser) tryStoreShared(packfileData []byte) bool {
+	sharedStorer, ok := p.storage.(storer.SharedPackfileCapable)
+	if !ok {
+		return false
+	}
+
+	identity, err := p.getPackfileIdentity()
+	if err != nil {
+		return false
+	}
+
+	return sharedStorer.SetPackfileDataShared(packfileData, identity) == nil
+}
+
+// storePackfileLegacy stores packfile data using the legacy SetPackfileData method.
+func (p *Parser) storePackfileLegacy(packfileData []byte) {
+	packfileStorer, ok := p.storage.(PackfileDataStorer)
+	if !ok {
+		return
+	}
+	// Ignore error - lazy loading will still work, just without persistence
+	_ = packfileStorer.SetPackfileData(packfileData)
+}
+
+// getPackfileIdentity extracts the filesystem identity from the packfile path.
+func (p *Parser) getPackfileIdentity() (storer.PackfileIdentity, error) {
+	identity, err := shared.GetPackfileIdentity(p.packfilePath)
+	if err != nil {
+		return storer.PackfileIdentity{}, err
+	}
+
+	return storer.PackfileIdentity{
+		Inode:  identity.Inode,
+		Device: identity.Device,
+		Size:   identity.Size,
+		Mtime:  identity.Mtime,
+	}, nil
 }
 
 func (p *Parser) storeOrCache(oh *ObjectHeader) error {
